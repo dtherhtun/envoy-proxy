@@ -1,110 +1,46 @@
 # OIDC / OAuth2 / Keycloak Patterns (v1.38.0)
 
-Complete reference for all three authentication integration patterns with Keycloak, plus filter ordering guidance.
+Three integration patterns, from simplest to most flexible:
+
+| Pattern | Use Case | Filter |
+|---------|----------|--------|
+| **A — Native OAuth2** | Browser SSO, authorization code flow | `envoy.filters.http.oauth2` |
+| **B — JWT validation** | API-to-API, tokens already issued | `envoy.filters.http.jwt_authn` |
+| **C — ExtAuthz** | Complex auth, token introspection, group checks | `envoy.filters.http.ext_authz` |
+
+---
 
 ## Filter Ordering (Critical)
 
-The correct ordering of HTTP filters from first to last:
-
 ```
-oauth2 (browser SSO)
-→ jwt_authn (JWT validation)
-→ rbac (access control)
-→ wasm (custom WASM plugin)
-→ ext_authz (external auth, optional)
-→ local_ratelimit (rate limiting)
-→ cors (CORS preflight handling)
-→ header_mutation (header manipulation)
-→ health_check (health check passthrough)
-→ lua (scripting)
-→ router (final forwarding)
+oauth2 → jwt_authn → rbac → wasm → ext_authz → local_ratelimit → cors → header_mutation → lua → router
 ```
 
-**Rules:**
+Rules:
 - `router` must always be last.
-- `oauth2` must come before `jwt_authn` — OAuth2 sets cookies that JWT validation reads.
-- `jwt_authn` before `rbac` — RBAC rules should check decoded JWT claims.
-- `ext_authz` before `local_ratelimit` — Auth decision precedes rate limit.
-- Never place `cors` before `ext_authz` — OPTIONS preflight bypasses auth.
+- `oauth2` before `jwt_authn` — OAuth2 sets cookies that JWT reads.
+- `jwt_authn` before `rbac` — RBAC checks decoded JWT claims.
+- Never put `cors` before `ext_authz` — OPTIONS preflight would bypass auth.
+
+---
 
 ## Keycloak URL Patterns
 
-| Endpoint | Keycloak URL Pattern | Description |
-|----------|---------------------|-------------|
-| Discovery | `https://keycloak.example.com/realms/{realm}/.well-known/openid-configuration` | OIDC provider metadata |
-| Authorization | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/auth` | OAuth2 authorization endpoint |
-| Token | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/token` | Token issuance endpoint |
-| JWKS | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/certs` | Public key set for JWT verification |
-| Userinfo | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/userinfo` | User info endpoint |
-| Logout | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/logout` | Logout redirect endpoint |
-| Introspect | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/token/introspect` | Token introspection |
-
-**Realm URL:** `https://keycloak.example.com/realms/{realm}`
-
-Replace `{realm}` with your realm name (default: `master` for admin, or a custom realm like `production`).
+| Endpoint | URL |
+|----------|-----|
+| OIDC Discovery | `https://keycloak.example.com/realms/{realm}/.well-known/openid-configuration` |
+| Authorization | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/auth` |
+| Token | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/token` |
+| JWKS | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/certs` |
+| UserInfo | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/userinfo` |
+| Logout | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/logout` |
+| Introspect | `https://keycloak.example.com/realms/{realm}/protocol/openid-connect/token/introspect` |
 
 ---
 
 ## Pattern A — Native OAuth2 Filter (Browser SSO)
 
-### Purpose
-Handles browser-based single sign-on via OAuth2 authorization code flow.
-
-### OAuth2 Filter Configuration
-
-```yaml
-http_filters:
-- name: envoy.filters.http.oauth2
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
-    token_endpoint:
-      cluster: oauth_service
-      uri: "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token"
-      timeout: 3s
-    authorization_endpoint: "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/auth"
-    redirect_uri: "%REQ(x-forwarded-proto)%://%REQ(:authority)%/callback"
-    redirect_path_matcher:
-      path:
-        exact: /callback
-    signout_path:
-      path:
-        exact: /signout
-    pass_through_matcher:
-      header_matcher:
-        exact_match: "public"
-        name: x-auth-mode
-    forward_bearer_token: true
-    auth_scopes: ["openid", "profile", "email"]
-    credentials:
-      client_id: "envoy-proxy"
-      token_secret:
-        name: oauth_token
-        sds_config:
-          path: "/etc/envoy/secrets/oauth-token.yaml"
-      hmac_secret:
-        name: oauth_hmac
-        sds_config:
-          path: "/etc/envoy/secrets/oauth-hmac.yaml"
-    use_refresh_token: true
-    cookie_names:
-      bearer_token: "OAuth2_BearerToken"
-      hmac: "OAuth2_HMAC"
-      expires: "OAuth2_Expires"
-      id_token: "OAuth2_IdToken"
-      refresh_token: "OAuth2_RefreshToken"
-    deny_redirect_matcher:
-      header_matcher:
-        regex_match: "X-Requested-With:.*XMLHttpRequest|application/json"
-        name: x-requested-with
-```
-
-### SDS Secrets for OAuth2
-
-OAuth2 filter needs two secrets via SDS:
-1. **token_secret** — `GenericSecret` containing the OAuth2 client secret
-2. **hmac_secret** — `GenericSecret` for HMAC-encoding OAuth2 cookies
-
-Both are served from a single SDS watch file:
+### SDS Secrets (required — never inline)
 
 ```yaml
 # /etc/envoy/secrets/oauth-secrets.yaml
@@ -113,13 +49,67 @@ resources:
   name: oauth_token
   generic_secret:
     secret:
-      filename: "/etc/envoy/secrets/oauth-client-secret.txt"  # OAuth2 client secret
+      filename: /etc/envoy/secrets/oauth-client-secret.txt  # OAuth2 client secret
 - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
   name: oauth_hmac
   generic_secret:
     secret:
-      filename: "/etc/envoy/secrets/oauth-hmac-secret.txt"    # HMAC key, 16+ bytes
+      filename: /etc/envoy/secrets/oauth-hmac-key.txt       # Random key ≥ 32 bytes
 ```
+
+### OAuth2 Filter Config
+
+```yaml
+- name: envoy.filters.http.oauth2
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
+    config:
+      token_endpoint:
+        cluster: keycloak
+        uri: "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token"
+        timeout: 5s
+      authorization_endpoint: "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/auth"
+      redirect_uri: "%REQ(x-forwarded-proto)%://%REQ(:authority)%/callback"
+      redirect_path_matcher:
+        path:
+          exact: /callback
+      signout_path:
+        path:
+          exact: /signout
+      credentials:
+        client_id: "envoy-proxy"
+        token_secret:
+          name: oauth_token
+          sds_config:
+            path: /etc/envoy/secrets/oauth-secrets.yaml
+        hmac_secret:
+          name: oauth_hmac
+          sds_config:
+            path: /etc/envoy/secrets/oauth-secrets.yaml
+      auth_scopes:
+      - openid
+      - profile
+      - email
+      - roles
+      forward_bearer_token: true
+      use_refresh_token: true
+      # cookie_names uses these exact field names (not "hmac" or "expires"):
+      cookie_names:
+        bearer_token: "OAuth2_BearerToken"
+        oauth_hmac: "OAuth2_HMAC"
+        oauth_expires: "OAuth2_Expires"
+        id_token: "OAuth2_IdToken"
+        refresh_token: "OAuth2_RefreshToken"
+      # Routes to skip OAuth2 (public paths):
+      pass_through_matcher:
+      - name: ":path"
+        prefix_match: "/api/public/"
+      - name: ":path"
+        exact_match: "/healthz"
+```
+
+> `pass_through_matcher` takes a **list of `HeaderMatcher`** directly — no `header_matcher:` wrapper.
+> `cookie_names` fields: `bearer_token`, `oauth_hmac`, `oauth_expires`, `id_token`, `refresh_token`.
 
 ### Route Config for OAuth2
 
@@ -130,26 +120,29 @@ route_config:
   - name: web_app
     domains: ["proxy.example.com"]
     routes:
+    # Disable OAuth2 on the callback route itself
     - match:
         path: /callback
       route:
-        cluster: oauth_service
-        timeout: 3s
-      # Per-route: disable OAuth2 on callback
+        cluster: keycloak
+        timeout: 5s
       typed_per_filter_config:
-        type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2PerRoute:
+        envoy.filters.http.oauth2:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2PerRoute
           disabled: true
 
+    # Disable OAuth2 on signout too
     - match:
         path: /signout
       direct_response:
         status: 302
-        headers:
+        headers_to_add:
         - header:
             key: Location
             value: "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/logout?redirect_uri=https://proxy.example.com/"
       typed_per_filter_config:
-        type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2PerRoute:
+        envoy.filters.http.oauth2:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2PerRoute
           disabled: true
 
     - match:
@@ -159,56 +152,29 @@ route_config:
         timeout: 30s
 ```
 
-### SDS GenericSecret Pattern for OAuth2
-
-OAuth2 filter needs two secrets via SDS:
-1. **token_secret** — `GenericSecret` containing the OAuth2 client secret
-2. **hmac_secret** — `GenericSecret` for HMAC-encoding OAuth2 cookies
+### Keycloak Cluster
 
 ```yaml
-# /etc/envoy/secrets/generic-secret.yaml
-resources:
-- "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
-  name: oauth_token
-  generic_secret:
-    secret:
-      filename: "/etc/envoy/secrets/oauth-client-secret.txt"  # OAuth2 client secret
-- "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
-  name: oauth_hmac
-  generic_secret:
-    secret:
-      filename: "/etc/envoy/secrets/oauth-hmac-secret.txt"    # Arbitrary string, 16+ bytes recommended
-```
-
-### Public Routes (pass_through_matcher)
-
-```yaml
-routes:
-- match:
-    prefix: /public/
-    headers:
-    - name: x-auth-mode
-      exact_match: "public"
-  route:
-    cluster: public_service
-  typed_per_filter_config:
-    type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2PerRoute:
-      disabled: true
-    type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthenticationPerRoute:
-      disabled: true
+- name: keycloak
+  type: STRICT_DNS
+  connect_timeout: 5s
+  lb_policy: ROUND_ROBIN
+  load_assignment:
+    cluster_name: keycloak
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: keycloak.example.com
+              port_value: 8080
 ```
 
 ---
 
 ## Pattern B — JWT Validation Only (API-to-API)
 
-### Purpose
-Validates JWT tokens for service-to-service authentication (no browser session management).
-
-### JWT Filter Configuration
-
 ```yaml
-http_filters:
 - name: envoy.filters.http.jwt_authn
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
@@ -221,170 +187,139 @@ http_filters:
         remote_jwks:
           http_uri:
             uri: "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs"
-            timeout: 5s
             cluster: keycloak_jwks
+            timeout: 5s
           cache_duration: 300s
-          overlapping_unit: 60s
+        # Where to look for the token:
         from_headers:
         - name: "Authorization"
           value_prefix: "Bearer "
-        from_params:
-        - name: "access_token"
         from_cookies:
-        - name: "jwt_token"
+        - name: "OAuth2_BearerToken"
+        # Forward JWT claims as request headers to upstream:
         claim_to_headers:
-        - key: "x-subject"
-          claim: "sub"
-          format: "Bearer %s"
-        - key: "x-email"
-          claim: "email"
-        - key: "x-audience"
-          claim: "aud"
-        - key: "x-realm-access-roles"
-          claim: "realm_access.roles"
-          format: "%s"
+        - header_name: "x-user-id"
+          claim_name: "sub"
+        - header_name: "x-user-email"
+          claim_name: "email"
+        - header_name: "x-user-roles"
+          claim_name: "realm_access.roles"
+        forward: true                              # forward original token upstream
+        forward_payload_header: "x-jwt-payload"   # base64-encoded payload header
     rules:
-    # Public API: no JWT required
+    # No JWT required on public routes
     - match:
-        prefix: /public/
-      requires: ""  # Empty = no JWT required
-
-    # Authenticated API: JWT required
+        prefix: /api/public/
+      requires:
+        allow_missing_or_failed: {}
+    # JWT required on all other routes
     - match:
         prefix: /api/
-      requires: "valid-jwt"
-
-    # Admin API: JWT required + specific role
+      requires:
+        provider_name: keycloak_provider
+    # Require JWT for admin routes
     - match:
         prefix: /admin/
-      requires_any:
-        requirements:
-        - "valid-jwt"
-        - "admin-role"
-
+      requires:
+        provider_name: keycloak_provider
+    # Default: require JWT
     - match:
-        path: /api/internal
-        headers:
-        - name: x-forwarded-for
-          prefix_match: "10.0.0."
-      requires_any:
-        requirements:
-        - "valid-jwt"
-        - "internal-network"
-
-    requires:
-      valid-jwt:
+        prefix: /
+      requires:
         provider_name: keycloak_provider
-        forward: true
-        forward_payload_header: "x-forwarded-jwt-payload"
-      admin-role:
-        provider_name: keycloak_provider
-        require_audience: "admin-service"
-        require_claims:
-        - key: "realm_access.roles"
-          string_values: ["admin"]
-        forward: true
-      internal-network:
-        provider_name: keycloak_provider
-        forward: false
 ```
 
-### Per-Route JWT Override
+> `claim_to_headers` uses `header_name` and `claim_name` fields. There is no `format` field.
+> `rules[].requires` takes an inline `JwtRequirement` — not a string reference.
+> Use `allow_missing_or_failed: {}` to skip JWT validation on a route.
+
+### Disable JWT on a specific route
 
 ```yaml
-- match:
-    path: /api/health
-  route:
-    cluster: backend_service
-  typed_per_filter_config:
-    type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthenticationPerRoute:
-      disabled: true
+typed_per_filter_config:
+  envoy.filters.http.jwt_authn:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthenticationPerRoute
+    disabled: true
 ```
 
-### JWT Security Notes
+### JWKS cluster
 
-| Setting | Recommendation |
-|---------|---------------|
-| `remote_jwks.cache_duration` | 300s (5 min) — balance between freshness and performance |
-| `remote_jwks.overlapping_unit` | 60s — overlap window for JWKS rotation |
-| `from_headers.value_prefix` | "Bearer " (with trailing space) |
-| `forward` | true — forward original token to upstream |
-| `forward_payload_header` | Use non-standard header to avoid confusion |
+```yaml
+- name: keycloak_jwks
+  type: STRICT_DNS
+  connect_timeout: 5s
+  lb_policy: ROUND_ROBIN
+  load_assignment:
+    cluster_name: keycloak_jwks
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: keycloak.example.com
+              port_value: 8080
+```
 
 ---
 
 ## Pattern C — ExtAuthz with oauth2-proxy Sidecar
 
-### Purpose
-Offload OIDC authentication to a sidecar `oauth2-proxy` (backed by Keycloak), letting ExtAuthz handle the auth decision.
-
-### ExtAuthz Configuration
-
 ```yaml
-http_filters:
 - name: envoy.filters.http.ext_authz
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
     http_service:
       server_uri:
         cluster: oauth2_proxy
-        uri: /api/auth
-        port_value: 4180
+        uri: "http://oauth2-proxy:4180/oauth2/auth"
+        timeout: 5s
       authorization_request:
         allowed_headers:
-        - "authorization"
-        - "cookie"
-        - "x-forwarded-for"
-        - "x-forwarded-proto"
-        - "x-forwarded-host"
-        - "x-forwarded-port"
-        - "x-request-id"
+          patterns:
+          - exact: "authorization"
+          - exact: "cookie"
+          - prefix: "x-forwarded-"
+          - exact: "x-request-id"
+      authorization_response:
         allowed_upstream_headers:
-        - "Location"
-        - "Set-Cookie"
-        - "X-Auth-Request-Redirect"
-        - "X-Auth-Request-User"
-        - "X-Auth-Request-Email"
-        - "X-Auth-Request-Groups"
-      failure_mode_allow: false  # ← Deny if proxy is down
+          patterns:
+          - exact: "set-cookie"
+          - exact: "x-auth-request-user"
+          - exact: "x-auth-request-email"
+          - exact: "x-auth-request-groups"
+    failure_mode_allow: false    # deny if oauth2-proxy is unreachable
     transport_api_version: V3
 ```
 
-### oauth2-proxy Configuration (Keycloak Backend)
+> `allowed_upstream_headers` belongs in `authorization_response`, not `authorization_request`.
+> `server_uri` fields: `cluster`, `uri`, `timeout` — there is no `port_value` field.
+
+### oauth2-proxy (Keycloak backend)
 
 ```bash
-# Typical oauth2-proxy flags for Keycloak
 oauth2-proxy \
-  --provider="keycloak-oidc" \
-  --email-domain="example.com" \
-  --upstream="http://127.0.0.1:8080" \
-  --http-address="0.0.0.0:4180" \
-  --skip-jwt-access-tokens \
-  --set-xauthrequest="true" \
-  --set-authorization-header="true" \
-  --cookie-secret="$(cat /etc/oauth2-proxy/secret.txt)" \
-  --client-id="envoy-proxy" \
-  --client-secret="$(cat /etc/oauth2-proxy/client-secret.txt)" \
-  --cookie-domain=".proxy.example.com" \
-  --cookie-samesite="lax" \
-  --cookie-secure="true" \
-  --oidc-issuer-url="https://keycloak.example.com/realms/myrealm" \
-  --insecure-oauth2-endpoint \
-  --redirect-url="https://proxy.example.com/callback" \
-  --whitelist-domain=".proxy.example.com" \
-  --pass-basic-auth="false" \
-  --pass-user-headers \
-  --passes-all-headers \
-  --request_logging \
-  --request-logging-enable \
-  --debug
+  --provider=keycloak-oidc \
+  --oidc-issuer-url=https://keycloak.example.com/realms/myrealm \
+  --client-id=envoy-proxy \
+  --client-secret=$(cat /etc/oauth2-proxy/client-secret.txt) \
+  --cookie-secret=$(cat /etc/oauth2-proxy/cookie-secret.txt) \
+  --redirect-url=https://proxy.example.com/oauth2/callback \
+  --email-domain=example.com \
+  --upstream=static://200 \
+  --http-address=0.0.0.0:4180 \
+  --set-xauthrequest=true \
+  --set-authorization-header=true \
+  --pass-user-headers=true \
+  --cookie-secure=true \
+  --cookie-samesite=lax
 ```
 
-### OAuth2-Proxy Sidecar Cluster
+### oauth2-proxy cluster
 
 ```yaml
 - name: oauth2_proxy
   type: STRICT_DNS
+  connect_timeout: 5s
   lb_policy: ROUND_ROBIN
   load_assignment:
     cluster_name: oauth2_proxy
@@ -399,71 +334,94 @@ oauth2-proxy \
 
 ---
 
-## Complete Filter Chain Example (OAuth2 + JWT + RBAC)
+## RBAC Filter
+
+Each RBAC filter instance has **one action** (`ALLOW` or `DENY`) plus a policies map.
+To enforce both ALLOW and DENY logic, use two RBAC filters in sequence.
 
 ```yaml
-http_filters:
-# 1. OAuth2 — browser SSO
-- name: envoy.filters.http.oauth2
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
-    # ... (as shown in Pattern A)
-
-# 2. JWT — API auth
-- name: envoy.filters.http.jwt_authn
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
-    # ... (as shown in Pattern B)
-
-# 3. RBAC — IP + role-based access
+# Filter 1: ALLOW only known service accounts
 - name: envoy.filters.http.rbac
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
     rules:
-      allow_admin:
-        action: ALLOW
-        policies:
-          admin-policy:
-            permission:
-              and_rules:
-                rules:
-                - header:
-                    name: "x-forwarded-for"
-                    prefix_match: "10.0.0."
-                - header:
-                    name: "x-admin"
-                    exact_match: "true"
-            principal:
-              authenticated:
-                principal_name:
-                  exact_match: "cluster.local/ns/default/sa/admin-sa"
-      deny_external:
-        action: DENY
-        policies:
-          deny-external-admin:
-            permission:
-              header:
-                name: "x-admin"
-                exact_match: "true"
-            principal:
-              not_principal:
-                authenticated:
-                  principal_name:
-                    regex_match: "cluster\\.local/ns/default/sa.*"
+      action: ALLOW
+      policies:
+        allow-internal-services:
+          permissions:
+          - any: true
+          principals:
+          - authenticated:
+              principal_name:
+                safe_regex:
+                  regex: "spiffe://trust-domain/ns/default/sa/.*"
 
-# 4. CORS
+# Filter 2: DENY admin paths from external IPs
+- name: envoy.filters.http.rbac
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+    rules:
+      action: DENY
+      policies:
+        block-external-admin:
+          permissions:
+          - header:
+              name: ":path"
+              prefix_match: "/admin/"
+          principals:
+          - not_id:
+              remote_ip:
+                address_prefix: "10.0.0.0"
+                prefix_len: 8
+```
+
+---
+
+## Complete Filter Chain (OAuth2 + JWT + RBAC + CORS)
+
+```yaml
+http_filters:
+# 1. Browser SSO
+- name: envoy.filters.http.oauth2
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.oauth2.v3.OAuth2
+    config: { ... }   # see Pattern A
+
+# 2. API token validation
+- name: envoy.filters.http.jwt_authn
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication
+    # ... see Pattern B
+
+# 3. Role / IP access control
+- name: envoy.filters.http.rbac
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+    rules:
+      action: ALLOW
+      policies:
+        allow-authenticated:
+          permissions:
+          - any: true
+          principals:
+          - any: true
+
+# 4. Rate limiting
+- name: envoy.filters.http.local_ratelimit
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit
+    stat_prefix: local_rate_limit
+    token_bucket:
+      max_tokens: 100
+      tokens_per_fill: 100
+      fill_interval: 60s
+
+# 5. CORS
 - name: envoy.filters.http.cors
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
-    allow_origin_string_match:
-    - prefix: "https://app.example.com"
-    allow_methods: "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-    allow_headers: "authorization, content-type, x-request-id, x-forwarded-for"
-    expose_headers: "x-request-id, x-auth-user"
-    max_age: "3600"
-    supports_credentials: true
 
-# 5. Router (last)
+# 6. Router (always last)
 - name: envoy.filters.http.router
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -471,20 +429,16 @@ http_filters:
 
 ---
 
-## Keycloak Configuration Checklist
+## Keycloak Client Configuration Checklist
 
-| Setting | Required Value | Notes |
-|---------|---------------|-------|
-| Client Type | `openid-connect` | Standard OIDC client |
-| Access Type | `confidential` | For OAuth2 auth code flow |
-| Root URL | `https://proxy.example.com/*` | Must match proxy domain |
-| Valid Redirect URIs | `https://proxy.example.com/callback` | OAuth2 callback URL |
-| Web Origins | `https://proxy.example.com` | CORS origins |
-| Logout URL | `https://proxy.example.com/signout` | Logout redirect |
-| Service Accounts | `ENABLED` (if using machine-to-machine) | For service account flow |
-| Standard Flow | `ENABLED` | Authorization code flow |
-| Direct Access Grants | `DISABLED` (unless needed) | Resource Owner flow |
-| Client Credentials | `ENABLED` (if needed) | For machine-to-machine |
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Client Protocol | `openid-connect` | Standard OIDC |
+| Access Type | `confidential` | Required for auth code flow |
+| Valid Redirect URIs | `https://proxy.example.com/callback` | Must match `redirect_uri` |
+| Web Origins | `https://proxy.example.com` | For CORS |
+| Standard Flow | `Enabled` | Authorization code flow |
+| Direct Access Grants | `Disabled` | Unless needed for testing |
 
 ---
 
@@ -492,15 +446,19 @@ http_filters:
 
 | Pitfall | Impact | Fix |
 |---------|--------|-----|
-| Wrong Keycloak realm URL | Auth flow fails with 401/404 | Use `/realms/{realm}/protocol/openid-connect/...` format |
-| Missing `hmac_secret` in OAuth2 filter | Cookies can't be set/verified | Configure both `token_secret` and `hmac_secret` via SDS |
-| `pass_through_matcher` not set on public routes | Public routes go through OAuth flow | Use `pass_through_matcher` or per-route `OAuth2PerRoute: {disabled: true}` |
-| `redirect_uri` scheme mismatch (http vs https) | Keycloak rejects callback | Use `%REQ(x-forwarded-proto)%` for correct scheme from TLS terminator |
-| Missing `tls_minimum_protocol_version` | Weak TLS allowed | Set `TLS_V1_2` minimum |
-| CORS before ext_authz on same listener | OPTIONS requests bypass auth | Place CORS after ext_authz or use `filter_enabled` on OPTIONS routes |
-| `failure_mode_allow: false` with single oauth2-proxy | Total auth failure on proxy restart | Add multiple replicas behind a load balancer |
-| jwt_authn `from_params` enabled on production | JWT in URL (bookmarks, logs) | Use `from_headers` only for production; `from_params` for debugging |
-| JWT `issuer` not matching Keycloak | All JWT validation fails | Set `issuer: "https://keycloak.example.com/realms/myrealm"` exactly |
-| Missing `audiences` in jwt_authn | Token accepted without audience check | Always configure `audiences` list |
-| Redundant JWT validation + OAuth2 | Requests validated twice | Disable JWT validation on routes covered by OAuth2 cookie |
-| Keycloak client secret as plain text in config | Secret exposure risk | Always use SDS `GenericSecret` — never inline |
+| String-reference `requires: "valid-jwt"` in JWT rules | Config rejected — not a valid proto field | Use inline `JwtRequirement`: `requires: { provider_name: keycloak_provider }` |
+| `requires: ""` to skip JWT | Empty string is not valid | Use `allow_missing_or_failed: {}` |
+| `pass_through_matcher: header_matcher: { ... }` | Extra wrapper key — rejected | `pass_through_matcher` is a list of `HeaderMatcher` directly |
+| `cookie_names.hmac` or `cookie_names.expires` | Wrong field names — silently ignored | Use `oauth_hmac` and `oauth_expires` |
+| `claim_to_headers[].key` | Wrong field name | Use `header_name` |
+| `claim_to_headers[].claim` | Wrong field name | Use `claim_name` |
+| `claim_to_headers[].format` | Field doesn't exist | Remove it |
+| `overlapping_unit` in `remote_jwks` | Field doesn't exist — rejected | Remove; use `cache_duration` only |
+| `deny_redirect_matcher` in OAuth2Config | Field doesn't exist | Remove it |
+| `port_value` in ExtAuthz `server_uri` | Field doesn't exist | Put port in the cluster socket_address |
+| `allowed_upstream_headers` in `authorization_request` | Wrong block — headers not forwarded | Move to `authorization_response` |
+| Two `action:` types in one RBAC filter | Proto only allows one action per filter | Use two RBAC filter instances |
+| Missing `hmac_secret` SDS config | OAuth2 cookies cannot be signed/verified | Always configure both `token_secret` and `hmac_secret` |
+| JWT `issuer` mismatch with Keycloak | All token validation fails | `issuer` must exactly match Keycloak's `iss` claim |
+| Missing `audiences` in jwt_authn | Tokens accepted without audience check | Always set `audiences` to the expected client IDs |
+| Redundant JWT + OAuth2 on same route | Requests validated twice, duplicate latency | Disable JWT on routes covered by OAuth2 using `JwtAuthenticationPerRoute.disabled` |

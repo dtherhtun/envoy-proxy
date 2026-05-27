@@ -1,68 +1,33 @@
 # Envoy WASM Plugin Configuration (v1.38.0)
 
-Complete reference for WASM filters, runtimes, source types, configuration patterns, and the OIDC-via-WASM integration pattern.
-
-## WASM Filter Overview
+Complete reference for WASM filters, runtimes, source types, and the OIDC-via-WASM pattern.
 
 **@type:** `type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm`
 
-The WASM filter enables custom logic via WebAssembly plugins. Envoy supports multiple WASM runtimes and three source types for plugin deployment.
+---
 
 ## Runtimes
 
-| Runtime | Description | Best For |
-|---------|-------------|----------|
-| `v8` | V8 engine (C++ bindings) | JavaScript/TypeScript plugins, performance |
-| `wamr` | WebAssembly Micro Runtime (interpretive) | Portability, interpreted execution |
-| `wasmtime` | Cranelift-based runtime (AOT/JIT) | Performance, native-like speed |
-| `null` | No-op runtime (for testing) | Debugging filter chain behavior |
+| Runtime value | Engine | Best For |
+|---------------|--------|----------|
+| `envoy.wasm.runtime.v8` | V8 (default) | C++, Rust, AssemblyScript plugins |
+| `envoy.wasm.runtime.wasmtime` | Cranelift JIT | Performance-sensitive plugins |
+| `envoy.wasm.runtime.wamr` | Micro Runtime | Low-memory / embedded environments |
+| `envoy.wasm.runtime.null` | No-op (native) | Testing filter chain behavior only |
 
-**Selection:** Choose runtime via `vm_config.runtime`. Must be one of: `envoy.wasm.runtime.v8`, `envoy.wasm.runtime.wamr`, `envoy.wasm.runtime.wasmtime`, or `envoy.wasm.runtime.null`.
+---
 
 ## Source Types
 
-| Source | Use Case | Security |
-|--------|----------|----------|
-|| `local` | Development, minimal ops | Verify file integrity externally |
-|| `remote_url` | CI/CD pipelines, centralized | SHA-256 verified download |
-|| `inline_bytes` | Embedding small plugins | No network required, size-limited |
+| Field | Use Case | Notes |
+|-------|----------|-------|
+| `local: { filename: }` | Development, pre-baked images | Verify integrity externally |
+| `remote: { http_uri:, sha256: }` | CI/CD, centralized plugin registry | SHA-256 **required** for security |
+| `inline_bytes:` | Tiny plugins embedded in config | Base64-encoded; limit ~64 KB |
 
-**Source fields (v3):** `local` (filename), `remote` (http_uri + sha256), `inline_bytes`.
+---
 
-## Complete WASM Configuration
-
-### Remote WASM Plugin (Production-Grade)
-
-```yaml
-- name: envoy.filters.http.wasm
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
-    config:
-      name: "example-plugin"
-      root_id: "example_root"
-      configuration:
-        "@type": "type.googleapis.com/google.protobuf.StringValue"
-        value: |
-          {
-            "key1": "value1",
-            "key2": "value2"
-          }
-    vm_config:
-      vm_id: "unique_vm_id"           # Enables VM code sharing across filter instances
-      runtime: envoy.wasm.runtime.wasmtime
-      code:
-        remote:
-          http_uri:
-            uri: "https://plugins.example.com/example.wasm"
-            timeout: 30s
-            sha256: "ab12cd34ef56..."  # SHA-256 of the .wasm binary
-          trigger: ALWAYS
-      allow_precompiled: true
-      # Optional: per-proxy-wasm root config
-      # vm_config_envoyvars: true
-```
-
-### Local File WASM Plugin (Development)
+## Local File Plugin
 
 ```yaml
 - name: envoy.filters.http.wasm
@@ -72,104 +37,153 @@ The WASM filter enables custom logic via WebAssembly plugins. Envoy supports mul
       name: "local-plugin"
       root_id: "local_root"
       configuration:
-        "@type": "type.googleapis.com/google.protobuf.StringValue"
-        value: '{"debug": true}'
-    vm_config:
-      vm_id: "local_vm"
-      runtime: envoy.wasm.runtime.wasmtime
-      code:
-        local:
-          filename: "/etc/envoy/plugins/example.wasm"
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: |
+          {
+            "debug": true,
+            "log_level": "info"
+          }
+      vm_config:
+        vm_id: "local_vm"
+        runtime: envoy.wasm.runtime.v8
+        code:
+          local:
+            filename: "/etc/envoy/plugins/example.wasm"
 ```
 
-### Inline WASM Plugin (Small plugins only)
+## Remote Plugin (Production)
+
+SHA-256 is mandatory. Obtain it with `sha256sum example.wasm`.
 
 ```yaml
 - name: envoy.filters.http.wasm
   typed_config:
     "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
     config:
-      name: "inline-plugin"
-      root_id: "inline_root"
-    vm_config:
-      vm_id: "inline_vm"
-      runtime: envoy.wasm.runtime.v8
-      code:
-        inline_bytes: "<base64-wasm-binary>"  # Raw WASM bytes (base64)
-      # NOTE: inline_bytes is limited to ~64KB by Envoy
+      name: "remote-plugin"
+      root_id: "remote_root"
+      configuration:
+        "@type": type.googleapis.com/google.protobuf.StringValue
+        value: |
+          {
+            "key1": "value1",
+            "key2": "value2"
+          }
+      vm_config:
+        vm_id: "remote_vm"
+        runtime: envoy.wasm.runtime.v8
+        code:
+          remote:
+            http_uri:
+              uri: "https://plugins.example.com/example.wasm"
+              cluster: wasm_plugin_registry
+              timeout: 30s
+            sha256: "a948904f2f0f479b8f936dg..."  # sha256sum of .wasm binary
+            retry_policy:
+              retry_back_off:
+                base_interval: 1s
+                max_interval: 10s
+              num_retries: 3
 ```
 
-## VM_ID: Code Sharing
-
-When `vm_id` is identical across filter instances, Envoy shares a single WASM VM instance (one process memory space). This saves significant memory for large plugins.
+The cluster referenced in `http_uri.cluster` must be defined in `static_resources.clusters`:
 
 ```yaml
-# Two filter instances sharing one VM
-# Instance 1:
-vm_config:
-  vm_id: "auth-vm"
-  # ... code config
-
-# Instance 2 (on different listener/route):
-vm_config:
-  vm_id: "auth-vm"       # Same VM_ID = shared VM
-  # ... code config
+- name: wasm_plugin_registry
+  type: STRICT_DNS
+  connect_timeout: 10s
+  lb_policy: ROUND_ROBIN
+  load_assignment:
+    cluster_name: wasm_plugin_registry
+    endpoints:
+    - lb_endpoints:
+      - endpoint:
+          address:
+            socket_address:
+              address: plugins.example.com
+              port_value: 443
+  transport_socket:
+    name: envoy.transport_sockets.tls
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+      sni: plugins.example.com
 ```
 
-## Per-Route WASM Configuration
+## Inline Plugin (Small Only)
+
+```yaml
+vm_config:
+  vm_id: "inline_vm"
+  runtime: envoy.wasm.runtime.v8
+  code:
+    inline_bytes: "<base64-encoded-wasm-binary>"
+```
+
+---
+
+## VM Sharing with `vm_id`
+
+When two filter instances share the same `vm_id` and same code source, Envoy reuses one VM
+sandbox — saving memory for large plugins.
+
+```yaml
+# Listener A — plugin instance 1
+vm_config:
+  vm_id: "shared_auth_vm"
+  runtime: envoy.wasm.runtime.v8
+  code:
+    local:
+      filename: /etc/envoy/plugins/auth.wasm
+
+# Listener B — plugin instance 2 (same vm_id = shared sandbox)
+vm_config:
+  vm_id: "shared_auth_vm"
+  runtime: envoy.wasm.runtime.v8
+  code:
+    local:
+      filename: /etc/envoy/plugins/auth.wasm
+```
+
+---
+
+## Per-Route WASM Override
 
 ### Disable WASM on a specific route
 
 ```yaml
-# In route configuration:
+# In route config under virtual_hosts[].routes[]:
 typed_per_filter_config:
-  type.googleapis.com/envoy.extensions.filters.http.wasm.v3.WasmPerRoute:
+  envoy.filters.http.wasm:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.WasmPerRoute
     disabled: true
-
-# Or filter-level override:
-typed_per_filter_config:
-  type.googleapis.com/envoy.extensions.filters.http.wasm.v3.WasmPerRoute:
-    config:
-      root_id: ""              # Empty root_id = no-op
-      vm_id: ""
-      # or:
-      override:
-        config:
-          name: ""
 ```
 
-### Per-route configuration override
+`WasmPerRoute` has only one field: `disabled` (bool). There is no `config` or `override` subfield.
 
-```yaml
-typed_per_filter_config:
-  type.googleapis.com/envoy.extensions.filters.http.wasm.v3.WasmPerRoute:
-    config:
-      configuration:
-        "@type": "type.googleapis.com/google.protobuf.StringValue"
-        value: '{"mode": "override", "debug": true}'
-    # You can also disable specific hooks or add new ones
-```
+---
 
 ## Configuration Block Pattern
 
-The `configuration` field is a `google.protobuf.StringValue` containing JSON:
+Plugin configuration is passed as a JSON string inside `google.protobuf.StringValue`:
 
 ```yaml
 configuration:
-  "@type": "type.googleapis.com/google.protobuf.StringValue"
+  "@type": type.googleapis.com/google.protobuf.StringValue
   value: |
     {
       "allow_public_routes": true,
       "require_signed": false,
-      "plugins": ["/etc/envoy/plugins/"]
+      "upstream_header": "x-user-id"
     }
 ```
 
-This JSON is passed to the plugin at initialization time via `proxy_wasm_get_plugin_configuration()`.
+The plugin reads this at init time via `proxy_wasm_get_plugin_configuration()`.
+
+---
 
 ## OIDC via WASM Pattern
 
-This pattern uses a WASM plugin (typically `oidc.wasm` or similar proxy-wasm plugins) to implement OIDC authentication in Envoy when native Envoy OAuth2 filter is not desired or available.
+Used when native `envoy.filters.http.oauth2` is not available or a custom OIDC flow is needed.
 
 ```yaml
 - name: envoy.filters.http.wasm
@@ -179,70 +193,49 @@ This pattern uses a WASM plugin (typically `oidc.wasm` or similar proxy-wasm plu
       name: "oidc-wasm-plugin"
       root_id: "oidc_root"
       configuration:
-        "@type": "type.googleapis.com/google.protobuf.StringValue"
+        "@type": type.googleapis.com/google.protobuf.StringValue
         value: |
           {
-            "issuer_url": "https://keycloak.example.com/realms/myrealm",
-            "client_id": "envoy-proxy",
-            "client_secret": "REDACTED",
-            "scopes": ["openid", "email"],
-            "callback_url": "https://proxy.example.com/callback",
-            "logout_url": "https://proxy.example.com/logout",
+            "issuer_url":         "https://keycloak.example.com/realms/myrealm",
+            "client_id":          "envoy-proxy",
+            "client_secret":      "REPLACE_WITH_SECRET",
+            "scopes":             ["openid", "email", "profile"],
+            "callback_url":       "https://proxy.example.com/oidc/callback",
+            "logout_url":         "https://proxy.example.com/oidc/logout",
+            "jwks_uri":           "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs",
             "forward_access_token": true,
+            "access_token_header": "X-Access-Token",
+            "id_token_header":    "X-Id-Token",
             "upstream_headers_to_add": [
-              {"key": "Authorization", "value": "Bearer {{id_token}}"}
+              {"key": "X-User-Email", "value": "{{email}}"},
+              {"key": "X-User-Name",  "value": "{{name}}"}
             ]
           }
-    vm_config:
-      vm_id: "oidc_vm"
-      runtime: envoy.wasm.runtime.wasmtime
-      code:
-        remote:
-          http_uri:
-            uri: "https://plugins.example.com/oidc.wasm"
-            timeout: 30s
-            sha256: "sha256-hash-of-oidc.wasm"
-          trigger: ALWAYS
+      vm_config:
+        vm_id: "oidc_vm"
+        runtime: envoy.wasm.runtime.v8
+        code:
+          remote:
+            http_uri:
+              uri: "https://plugins.example.com/oidc.wasm"
+              cluster: wasm_plugin_registry
+              timeout: 30s
+            sha256: "replace-with-actual-sha256-of-oidc.wasm"
 ```
 
-### Keycloak Integration with OIDC WASM Plugin
-
-```yaml
-configuration:
-  "@type": "type.googleapis.com/google.protobuf.StringValue"
-  value: |
-    {
-      "issuer_url": "https://keycloak.example.com/realms/myrealm",
-      "client_id": "envoy-proxy",
-      "jwks_uri": "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs",
-      "scopes": ["openid", "profile", "email"],
-      "callback_url": "https://proxy.example.com/oidc/callback",
-      "logout_url": "https://proxy.example.com/oidc/logout",
-      "forward_access_token": true,
-      "access_token_header": "X-Access-Token",
-      "id_token_header": "X-Id-Token",
-      "upstream_headers_to_add": [
-        {"key": "X-User-Email", "value": "{{email}}"},
-        {"key": "X-User-Name", "value": "{{name}}"}
-      ],
-      "upstream_headers_to_remove": [
-        "Authorization",
-        "Cookie"
-      ]
-    }
-```
+---
 
 ## Common Pitfalls
 
 | Pitfall | Impact | Fix |
 |---------|--------|-----|
-| SHA-256 mismatch between config and actual .wasm | Plugin download rejected | Always verify SHA-256 after downloading: `sha256sum plugin.wasm` |
-| `root_id` mismatch between filter config and `vm_config` | Plugin initialization fails | `config.root_id` must exactly match the `vm_config` that references it |
-| Missing `vm_id` for shared plugins | Each filter creates a separate VM, high memory | Set `vm_id` to the same value across filter instances |
-| Using `inline_bytes` with large plugins | Envoy rejects the upload | Use `remote` or `local` for plugins > ~64KB |
-| WASM on upstream cluster without `allow_precompiled` | Precompiled code may be rejected | Set `allow_precompiled: true` in `vm_config` |
-| Multiple WASM filters on same listener | Conflicting execution, hard to debug | Use single WASM filter with multiple configurations via `typed_per_filter_config` |
-| Forgetting `trigger: ALWAYS` on remote source | Plugin not re-fetched on Envoy restart | Use `trigger: ALWAYS` for remote WASM code |
-| WASM runtime not available in binary | Envoy refuses config | Build Envoy with the target runtime (`v8`, `wasmtime`, or `wamr` compiled in) |
-| No log level set for WASM | Hard to debug plugin issues | Set `config.log_level: "trace"` during development |
-| WASM plugin blocks without using async API | Envoy request thread stuck | All I/O in WASM plugins must use async proxy-wasm APIs |
+| SHA-256 mismatch | Plugin download rejected at startup | Run `sha256sum plugin.wasm` and paste the exact value |
+| `root_id` mismatch between filter and plugin | Plugin silently skipped | `config.root_id` must match the root context registered in plugin code |
+| Missing `cluster` in `remote.http_uri` | Plugin fails to download | Define a cluster for the plugin registry host |
+| `local_file:` used instead of `local: { filename: }` | Config rejected | Correct field is `code.local.filename` |
+| `inline_bytes` with plugin > ~64 KB | Envoy rejects config | Use `local` or `remote` source for large plugins |
+| Missing `vm_id` on shared plugins | Each filter creates its own VM, high memory | Set identical `vm_id` across filter instances that share code |
+| `WasmPerRoute` with `config:` or `override:` | Config rejected — these fields don't exist | `WasmPerRoute` only has `disabled: true/false` |
+| WASM runtime not compiled into Envoy binary | Startup failure | Build Envoy with the target runtime or use the official distroless image |
+| Blocking I/O inside plugin without async API | Envoy thread stuck | All network I/O in plugins must use async proxy-wasm host calls |
+| No `log_level` set during development | Hard to debug | Add `"log_level": "trace"` in the plugin configuration JSON |
