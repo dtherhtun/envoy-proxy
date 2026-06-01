@@ -1,0 +1,53 @@
+# FAIL config — exercises every known pitfall
+node:
+  id: "bad-node"
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0        # CRITICAL: admin exposed
+      port_value: 9901
+
+static_resources:
+  listeners:
+    - name: broken-http
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8080
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typeConfig: {}     # PITFALL: deprecated field, ignored
+              # PITFALL: no stat_prefix
+              # PITFALL: no route_config, no rds
+              # PITFALL: missing @type in typed_config
+              # PITFALL: router filter not present
+              http_filters:
+                - name: envboy.filters.http.router   # typo in @type
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.config.http.v3.Router
+
+    - name: no-tls-https
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 443
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.config.network.v3.TcpProxy
+                stat_prefix: plain
+                cluster: backend_api
+
+  clusters:
+    - name: backend_api
+      # PITFALL: no connect_timeout
+      type: STRICT_DNS
+      # PITFALL: no load_assignment for STRIC_DNS type
+      # PITFALL: no health_checks
+      # PITFALL: no circuit_breakers
+      # PITFALL: no outlier_detection
+    - name: ghost_service       # referenced in route but not defined here
+      connect_timeout: 5s
