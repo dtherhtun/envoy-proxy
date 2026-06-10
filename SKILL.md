@@ -147,7 +147,3 @@ All mutations require POST; GET returns 400.
 2. **HIGH** — No connect_timeout, no health_checks, no circuit_breakers, no access_logs
 3. **MEDIUM** — No TLS resumption, no SNI, no upstream cert validation
 4. **LOW** — LB strategy, outlier thresholds
-
-## Related
-
-- Existing skill at `~/.hermes/skills/devops/envoy-proxy/` — broader WASM/OIDC patterns.

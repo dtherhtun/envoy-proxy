@@ -88,6 +88,6 @@ envoy-proxy/
 
 ## Repo
 
-Pushed to: `github.com:dtherhtun/envoyi-skills.git`
+Pushed to: `github.com/dtherhtun/envoy-proxy.git`
 
 Target Envoy version: `v1.38.0`
